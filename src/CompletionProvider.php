@@ -18,11 +18,17 @@ use Microsoft\PhpParser;
 use Microsoft\PhpParser\Node;
 use Microsoft\PhpParser\ResolvedName;
 use Generator;
+use function LanguageServer\FqnUtilities\{
+    nameConcat,
+    nameGetFirstPart,
+    nameGetParent,
+    nameStartsWith,
+    nameWithoutFirstPart
+};
 
 class CompletionProvider
 {
     const KEYWORDS = [
-        '?>',
         '__halt_compiler',
         'abstract',
         'and',
@@ -92,7 +98,25 @@ class CompletionProvider
         'var',
         'while',
         'xor',
-        'yield'
+        'yield',
+
+        // List of other reserved words (http://php.net/manual/en/reserved.other-reserved-words.php)
+        // (the ones which do not occur as actual keywords above.)
+        'int',
+        'float',
+        'bool',
+        'string',
+        'void',
+        'iterable',
+        'object',
+
+        // Pseudo keywords
+        '?>',
+        'yield from', // On yie|, suggest yield from (with the space)
+        'from', // As in yield from
+        'strict_types',
+        'ticks', // As in declare(ticks=1)
+        'encoding' // As in declare(encoding='EBCDIC')
     ];
 
     /**
@@ -224,14 +248,15 @@ class CompletionProvider
                 $this->definitionResolver->resolveExpressionNodeToType($node->dereferencableExpression)
             );
 
+            $prefix = '->' . ($node->memberName ? $node->memberName->getText($node->getFileContents()) : '');
+
             // The FQNs of the symbol and its parents (eg the implemented interfaces)
             foreach ($this->expandParentFqns($fqns) as $parentFqn) {
                 // Add the object access operator to only get members of all parents
-                $prefix = $parentFqn . '->';
-                $prefixLen = strlen($prefix);
+                $namespacedPrefix = $parentFqn . $prefix;
                 // Collect fqn definitions
                 foreach ($this->index->getChildDefinitionsForFqn($parentFqn) as $fqn => $def) {
-                    if (substr($fqn, 0, $prefixLen) === $prefix && $def->isMember) {
+                    if ($def->isMember && nameStartsWith($fqn, $namespacedPrefix)) {
                         $list->items[] = CompletionItem::fromDefinition($def);
                     }
                 }
@@ -250,6 +275,8 @@ class CompletionProvider
             //
             //     TODO: $a::|
 
+            $prefix = '::' . ($scoped->memberName ? $scoped->memberName->getText($scoped->getFileContents()) : '');
+
             // Resolve all possible types to FQNs
             $fqns = FqnUtilities\getFqnsFromType(
                 $classType = $this->definitionResolver->resolveExpressionNodeToType($scoped->scopeResolutionQualifier)
@@ -258,11 +285,10 @@ class CompletionProvider
             // The FQNs of the symbol and its parents (eg the implemented interfaces)
             foreach ($this->expandParentFqns($fqns) as $parentFqn) {
                 // Append :: operator to only get static members of all parents
-                $prefix = strtolower($parentFqn . '::');
-                $prefixLen = strlen($prefix);
+                $namespacedPrefix = $parentFqn . $prefix;
                 // Collect fqn definitions
                 foreach ($this->index->getChildDefinitionsForFqn($parentFqn) as $fqn => $def) {
-                    if (substr(strtolower($fqn), 0, $prefixLen) === $prefix && $def->isMember) {
+                    if ($def->isMember && nameStartsWith($fqn, $namespacedPrefix)) {
                         $list->items[] = CompletionItem::fromDefinition($def);
                     }
                 }
@@ -270,6 +296,7 @@ class CompletionProvider
 
         } elseif (
             ParserHelpers\isConstantFetch($node)
+            || $node instanceof Node\RelativeSpecifier
             // Creation gets set in case of an instantiation (`new` expression)
             || ($creation = $node->parent) instanceof Node\Expression\ObjectCreationExpression
             || (($creation = $node) instanceof Node\Expression\ObjectCreationExpression)
@@ -280,224 +307,304 @@ class CompletionProvider
             //    my_func|
             //    MY_CONS|
             //    MyCla|
+            //    \MyCla|
 
             // The name Node under the cursor
             $nameNode = isset($creation) ? $creation->classTypeDesignator : $node;
 
-            $filterNameTokens = static function ($tokens) {
-                return array_values(
-                    array_filter(
-                        $tokens,
-                        static function ($token): bool {
-                            return $token->kind === PhpParser\TokenKind::Name;
-                        }
-                    )
-                );
-            };
-
-            /** @var string[] The written name, exploded by \ */
-            $prefix = array_map(
-                static function ($part) use ($node) : string {
-                    return $part->getText($node->getFileContents());
-                },
-                $filterNameTokens(
-                    $nameNode instanceof Node\QualifiedName
-                    ? $nameNode->nameParts
-                    : [$nameNode]
-                )
-            );
-
-            if ($prefix === ['']) {
-                $prefix = [];
+            if ($nameNode instanceof Node\QualifiedName) {
+                /** @var string The typed name. If relative, without the namespace\. */
+                $prefix = (string)PhpParser\ResolvedName::buildName($nameNode->nameParts, $nameNode->getFileContents());
+            } else if ($nameNode instanceof Node\RelativeSpecifier) {
+                // The prefix is supposed to not have the leading namespace\ specifier. The token at point is
+                // "namespace\", so prefix should be empty.
+                $prefix = '';
+            } else {
+                $prefix = $nameNode->getText($node->getFileContents());
             }
 
-            /** Whether the prefix is qualified (contains at least one backslash) */
-            $isQualified = $nameNode instanceof Node\QualifiedName && $nameNode->isQualifiedName();
-
-            /** Whether the prefix is fully qualified (begins with a backslash) */
-            $isFullyQualified = $nameNode instanceof Node\QualifiedName && $nameNode->isFullyQualifiedName();
-
-            /** The closest NamespaceDefinition Node */
             $namespaceNode = $node->getNamespaceDefinition();
+            /** @var string The current namespace without a leading backslash. */
+            $currentNamespace = $namespaceNode === null ? '' : $namespaceNode->name->getText();
 
-            // Get the namespace use statements
-            // TODO: use function statements, use const statements
+            $isFullyQualified = false;
+            $isQualified = false;
+            $isRelative = false;
+            if ($nameNode instanceof Node\QualifiedName) {
+                /** @var bool Whether the prefix is qualified (contains at least one backslash) */
+                $isFullyQualified = $nameNode->isFullyQualifiedName();
+                /** @var bool|null Whether the prefix is qualified (contains at least one backslash) */
+                $isQualified = $nameNode->isQualifiedName();
+                /** @var bool Whether the prefix starts with namespace\ */
+                $isRelative = $nameNode->isRelativeName();
+            } else if ($nameNode instanceof Node\RelativeSpecifier) {
+                $isRelative = true;
+            }
 
-            /** @var string[] $aliases A map from local alias to fully qualified name */
-            list($aliases,,) = $node->getImportTablesForCurrentScope();
+            /** @var bool Whether we are in a new expression */
+            $isCreation = isset($creation);
 
-            /** @var array Array of [fqn=string, requiresRoaming=bool] the prefix may represent. */
-            $possibleFqns = [];
+            /** @var array Import (use) tables */
+            $importTables = $node->getImportTablesForCurrentScope();
 
             if ($isFullyQualified) {
-                // Case \Microsoft\PhpParser\Res|
-                $possibleFqns[] = [$prefix, false];
-            } else if ($fqnAfterAlias = $this->tryApplyAlias($aliases, $prefix)) {
-                // Cases handled here: (i.e. all namespaces involving use clauses)
-                //
-                //   use Microsoft\PhpParser\Node; //Note that Node is both a class and a namespace.
-                //   Nod|
-                //   Node\Qual|
-                //
-                //   use Microsoft\PhpParser as TheParser;
-                //   TheParser\Nod|
-                $possibleFqns[] = [$fqnAfterAlias, false];
-            } else if ($namespaceNode) {
-                // Cases handled here:
-                //
-                //    namespace Foo;
-                //    Microsoft\PhpParser\Nod| // Can refer only to \Foo\Microsoft, not to \Microsoft.
-                //
-                //    namespace Foo;
-                //    Test| // Can refer either to functions or constants at the global scope, or to
-                //          // everything below \Foo. (Global fallback / roaming)
-                /** @var \Microsoft\PhpParser\ResolvedName Declared namespace of the file (or section) */
-                $namespacedFqn = array_merge(
-                    array_map(
-                        static function ($token) use ($namespaceNode): string {
-                            return $token->getText($namespaceNode->getFileContents());
-                        },
-                        $filterNameTokens($namespaceNode->name->nameParts)
-                    ),
-                    $prefix
+                // \Prefix\Goes\Here| - Only return completions from the root namespace.
+                /** @var $items \Generator|CompletionItem[] Generator yielding CompletionItems indexed by their FQN */
+                $items = $this->getCompletionsForFqnPrefix($prefix, $isCreation, false);
+            } else if ($isRelative) {
+                // namespace\Something| - Only return completions from the current namespace.
+                $items = $this->getCompletionsForFqnPrefix(nameConcat($currentNamespace, $prefix), $isCreation, false);
+            } else if ($isQualified) {
+                // Prefix\Goes\Here|
+                $items = $this->getPartiallyQualifiedCompletions(
+                    $prefix,
+                    $currentNamespace,
+                    $importTables,
+                    $isCreation
                 );
-                $possibleFqns[] = [$namespacedFqn, false];
-                if (!$isQualified) {
-                    // Case of global fallback. If nothing is entered, also complete for root-level classnames.
-                    // If something has been entered, complete root-level roamed symbols only.
-                    $possibleFqns[] = [$prefix, !empty($prefix)];
-                }
             } else {
-                // Case handled here: (no namespace declaration in file)
-                //
-                // Microsoft\PhpParser\N|
-                $possibleFqns[] = [$prefix, false];
+                // PrefixGoesHere|
+                $items = $this->getUnqualifiedCompletions($prefix, $currentNamespace, $importTables, $isCreation);
             }
 
-            $prefixStr = implode('\\', $prefix);
-            /** @var int Length of $prefix */
-            $prefixLen = strlen($prefixStr);
-
-            // If there is a prefix that does not contain a slash, suggest used names.
-            if (!$isQualified) {
-                foreach ($aliases as $alias => $fqn) {
-                    // Suggest symbols that have been `use`d and match the prefix
-                    if (substr($alias, 0, $prefixLen) === $prefixStr
-                        && ($def = $this->index->getDefinition((string)$fqn))) {
-                        $list->items[] = CompletionItem::fromDefinition($def);
-                    }
+            $list->items = array_values(iterator_to_array($items));
+            foreach ($list->items as $item) {
+                // Remove ()
+                if (is_string($item->insertText) && substr($item->insertText, strlen($item->insertText) - 2) === '()') {
+                    $item->insertText = substr($item->insertText, 0, strlen($item->insertText) - 2);
                 }
             }
 
-            foreach ($possibleFqns as list ($fqnToSearch, $requiresRoaming)) {
-                $namespaceToSearch = $fqnToSearch;
-                array_pop($namespaceToSearch);
-                $namespaceToSearch = implode('\\', $namespaceToSearch);
-                $fqnToSearch = implode('\\', $fqnToSearch);
-                $fqnToSearchLen = strlen($fqnToSearch);
-                foreach ($this->index->getChildDefinitionsForFqn($namespaceToSearch) as $fqn => $def) {
-                    if (isset($creation) && !$def->canBeInstantiated) {
-                        // Only suggest classes for `new`
-                        continue;
-                    }
-                    if ($requiresRoaming && !$def->roamed) {
-                        continue;
-                    }
-
-                    if (substr($fqn, 0, $fqnToSearchLen) === $fqnToSearch) {
-                        $item = CompletionItem::fromDefinition($def);
-                        if (($aliasMatch = $this->tryMatchAlias($aliases, $fqn)) !== null) {
-                            $item->insertText = $aliasMatch;
-                        } else if ($namespaceNode && (empty($prefix) || $requiresRoaming)) {
-                            // Insert the global FQN with a leading backslash.
-                            // For empty prefix: Assume that the user wants an FQN. They have not
-                            // started writing anything yet, so we are not second-guessing.
-                            // For roaming: Second-guess that the user doesn't want to depend on
-                            // roaming.
-                            $item->insertText = '\\' . $fqn;
-                        } else {
-                            // Insert the FQN without a leading backslash
-                            $item->insertText = $fqn;
-                        }
-                        // Don't insert the parenthesis for functions
-                        // TODO return a snippet and put the cursor inside
-                        if (substr($item->insertText, -2) === '()') {
-                            $item->insertText = substr($item->insertText, 0, -2);
-                        }
-                        $list->items[] = $item;
-                    }
-                }
-            }
-
-            // Suggest keywords
-            if (!$isQualified && !isset($creation)) {
-                foreach (self::KEYWORDS as $keyword) {
-                    if (substr($keyword, 0, $prefixLen) === $prefixStr) {
-                        $item = new CompletionItem($keyword, CompletionItemKind::KEYWORD);
-                        $item->insertText = $keyword;
-                        $list->items[] = $item;
-                    }
-                }
-            }
         }
-
         return $list;
     }
 
-    private function tryMatchAlias(
-        array $aliases,
-        string $fullyQualifiedName
-    ): ?string {
-        $fullyQualifiedName = explode('\\', $fullyQualifiedName);
-        $aliasMatch = null;
-        $aliasMatchLength = null;
-        foreach ($aliases as $alias => $aliasFqn) {
-            $aliasFqn = $aliasFqn->getNameParts();
-            $aliasFqnLength = count($aliasFqn);
-            if ($aliasMatchLength && $aliasFqnLength < $aliasFqnLength) {
-                // Find the longest possible match. This one won't do.
-                continue;
-            }
-            $fqnStart = array_slice($fullyQualifiedName, 0, $aliasFqnLength);
-            if ($fqnStart === $aliasFqn) {
-                $aliasMatch = $alias;
-                $aliasMatchLength = $aliasFqnLength;
+    private function getPartiallyQualifiedCompletions(
+        string $prefix,
+        string $currentNamespace,
+        array $importTables,
+        bool $requireCanBeInstantiated
+    ): \Generator {
+        // If the first part of the partially qualified name matches a namespace alias,
+        // only definitions below that  alias can be completed.
+        list($namespaceAliases,,) = $importTables;
+        $prefixFirstPart = nameGetFirstPart($prefix);
+        $foundAlias = $foundAliasFqn = null;
+        foreach ($namespaceAliases as $alias => $aliasFqn) {
+            if (strcasecmp($prefixFirstPart, $alias) === 0) {
+                $foundAlias = $alias;
+                $foundAliasFqn = (string)$aliasFqn;
+                break;
             }
         }
 
-        if ($aliasMatch === null) {
-            return null;
+        if ($foundAlias !== null) {
+            yield from $this->getCompletionsFromAliasedNamespace(
+                $prefix,
+                $foundAlias,
+                $foundAliasFqn,
+                $requireCanBeInstantiated
+            );
+        } else {
+            yield from $this->getCompletionsForFqnPrefix(
+                nameConcat($currentNamespace, $prefix),
+                $requireCanBeInstantiated,
+                false
+            );
         }
-
-        $fqnNoAlias = array_slice($fullyQualifiedName, $aliasMatchLength);
-        return join('\\', array_merge([$aliasMatch], $fqnNoAlias));
     }
 
     /**
-     * Tries to convert a partially qualified name to an FQN using aliases.
+     * Yields completions for non-qualified global names.
      *
-     * Example:
+     * Yields
+     *  - Aliased classes
+     *  - Aliased functions (when not creating)
+     *  - Aliased constants (when not creating)
+     *  - Completions from current namespace
+     *  - Roamed completions from the global namespace (when not creating and not already in root NS)
+     *  - PHP keywords (when not creating)
      *
-     * use Microsoft\PhpParser as TheParser;
-     * "TheParser\Node" will convert to "Microsoft\PhpParser\Node"
+     * @return \Generator|CompletionItem[]
+     *   Yields CompletionItems
+     */
+    private function getUnqualifiedCompletions(
+        string $prefix,
+        string $currentNamespace,
+        array $importTables,
+        bool $requireCanBeInstantiated
+    ): \Generator {
+        // Aliases
+        list($namespaceAliases, $functionAliases, $constAliases) = $importTables;
+        // use Foo\Bar
+        yield from $this->getCompletionsForAliases(
+            $prefix,
+            $namespaceAliases,
+            $requireCanBeInstantiated,
+            CompletionItemKind::CLASS_
+        );
+        if (!$requireCanBeInstantiated) {
+            // use function Foo\createBar
+            yield from $this->getCompletionsForAliases($prefix, $functionAliases, false, CompletionItemKind::FUNCTION);
+            // use const Foo\BAR_TYPE_COCKTAIL
+            yield from $this->getCompletionsForAliases($prefix, $constAliases, false, CompletionItemKind::VARIABLE);
+        }
+
+        // Completions from the current namespace
+        yield from $this->getCompletionsForFqnPrefix(
+            nameConcat($currentNamespace, $prefix),
+            $requireCanBeInstantiated,
+            false
+        );
+
+        if ($currentNamespace !== '' && $prefix === '') {
+            // Get additional suggestions from the global namespace.
+            // When completing e.g. for new |, suggest \DateTime
+            yield from $this->getCompletionsForFqnPrefix('', $requireCanBeInstantiated, true);
+        }
+
+        if (!$requireCanBeInstantiated) {
+            if ($currentNamespace !== '' && $prefix !== '') {
+                // Roamed definitions (i.e. global constants and functions). The prefix is checked against '', since
+                // in that case global completions have already been provided (including non-roamed definitions.)
+                yield from $this->getRoamedCompletions($prefix);
+            }
+
+            // Lastly and least importantly, suggest keywords.
+            yield from $this->getCompletionsForKeywords($prefix);
+        }
+    }
+
+    /**
+     * Gets completions for prefixes of fully qualified names in their parent namespace.
      *
-     * @param \Microsoft\PhpParser\ResolvedName[] $aliases
-     *   Aliases available in the scope of resolution. Keyed by alias.
-     * @param string[] $partiallyQualifiedName
-     **/
-    private function tryApplyAlias(
+     * @param string $prefix Prefix to complete for. Fully qualified.
+     * @param bool $requireCanBeInstantiated If set, only return classes.
+     * @param bool $insertFullyQualified If set, return completion with the leading \ inserted.
+     * @return \Generator|CompletionItem[]
+     *   Yields CompletionItems.
+     */
+    private function getCompletionsForFqnPrefix(
+        string $prefix,
+        bool $requireCanBeInstantiated,
+        bool $insertFullyQualified
+    ): \Generator {
+        $namespace = nameGetParent($prefix);
+        foreach ($this->index->getChildDefinitionsForFqn($namespace) as $fqn => $def) {
+            if ($requireCanBeInstantiated && !$def->canBeInstantiated) {
+                continue;
+            }
+            if (!nameStartsWith($fqn, $prefix)) {
+                continue;
+            }
+            $completion = CompletionItem::fromDefinition($def);
+            if ($insertFullyQualified) {
+                $completion->insertText =  '\\' . $fqn;
+            }
+            yield $fqn => $completion;
+        }
+    }
+
+    /**
+     * Gets completions for non-qualified names matching the start of an used class, function, or constant.
+     *
+     * @param string $prefix Non-qualified name being completed for
+     * @param QualifiedName[] $aliases Array of alias FQNs indexed by the alias.
+     * @param int $defaultSymbolKind The SymbolKind:: constant to use when the definition for the alias is not found.
+     * @return \Generator|CompletionItem[]
+     *   Yields CompletionItems.
+     */
+    private function getCompletionsForAliases(
+        string $prefix,
         array $aliases,
-        array $partiallyQualifiedName
-    ): ?array {
-        if (empty($partiallyQualifiedName)) {
-            return null;
+        bool $requireCanBeInstantiated,
+        int $defaultCompletionItemKind
+    ): \Generator {
+        foreach ($aliases as $alias => $aliasFqn) {
+            if (!nameStartsWith($alias, $prefix)) {
+                continue;
+            }
+            $definition = $this->index->getDefinition((string)$aliasFqn);
+            if ($definition) {
+                if ($requireCanBeInstantiated && !$definition->canBeInstantiated) {
+                    continue;
+                }
+                $completionItem = CompletionItem::fromDefinition($definition);
+                $completionItem->insertText = $alias;
+                yield (string)$aliasFqn => $completionItem;
+            } else {
+                // Use clause referred to a symbol which was not indexed.
+                $completionItem = new CompletionItem($alias, $defaultCompletionItemKind);
+                $completionItem->detail = nameGetParent((string)$aliasFqn);
+                yield (string)$aliasFqn => $completionItem;
+            }
         }
-        $head = $partiallyQualifiedName[0];
-        $tail = array_slice($partiallyQualifiedName, 1);
-        if (!isset($aliases[$head])) {
-            return null;
+    }
+
+    /**
+     * Gets completions for partially qualified names, where the first part is matched by an alias.
+     *
+     * @return \Generator|CompletionItem[]
+     *   Yields CompletionItems.
+     */
+    private function getCompletionsFromAliasedNamespace(
+        string $prefix,
+        string $alias,
+        string $aliasFqn,
+        bool $requireCanBeInstantiated
+    ): \Generator {
+        $prefixFirstPart = nameGetFirstPart($prefix);
+        // Matched alias.
+        $resolvedPrefix = nameConcat($aliasFqn, nameWithoutFirstPart($prefix));
+        $completionItems = $this->getCompletionsForFqnPrefix(
+            $resolvedPrefix,
+            $requireCanBeInstantiated,
+            false
+        );
+        // Convert FQNs in the CompletionItems so they are expressed in terms of the alias.
+        foreach ($completionItems as $fqn => $completionItem) {
+            /** @var string $fqn with the leading parts determined by the alias removed. Has the leading backslash. */
+            $nameWithoutAliasedPart = substr($fqn, strlen($aliasFqn));
+            $completionItem->insertText = $alias . $nameWithoutAliasedPart;
+            yield $fqn => $completionItem;
         }
-        return array_merge($aliases[$head]->getNameParts(), $tail);
+    }
+
+    /**
+     * Gets completions for globally defined functions and constants (i.e. symbols which may be used anywhere)
+     *
+     * @return \Generator|CompletionItem[]
+     *   Yields CompletionItems.
+     */
+    private function getRoamedCompletions(string $prefix): \Generator
+    {
+        foreach ($this->index->getChildDefinitionsForFqn('') as $fqn => $def) {
+            if (!$def->roamed || !nameStartsWith($fqn, $prefix)) {
+                continue;
+            }
+            $completionItem = CompletionItem::fromDefinition($def);
+            // Second-guessing the user here - do not trust roaming to work. If the same symbol is
+            // inserted in the current namespace, the code will stop working.
+            $completionItem->insertText =  '\\' . $fqn;
+            yield $fqn => $completionItem;
+        }
+    }
+
+    /**
+     * Completes PHP keywords.
+     *
+     * @return \Generator|CompletionItem[]
+     *   Yields CompletionItems.
+     */
+    private function getCompletionsForKeywords(string $prefix): \Generator
+    {
+        foreach (self::KEYWORDS as $keyword) {
+            if (nameStartsWith($keyword, $prefix)) {
+                $item = new CompletionItem($keyword, CompletionItemKind::KEYWORD);
+                $item->insertText = $keyword;
+                yield $keyword => $item;
+            }
+        }
     }
 
     /**
